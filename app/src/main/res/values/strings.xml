@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">letnievpn</string>
+    <string name="status_off">Отключено</string>
+    <string name="status_connecting">Подключение…</string>
+    <string name="status_on">Подключено</string>
+    <string name="hint_tap">Нажмите, чтобы подключиться</string>
+    <string name="smart_title">Умное подключение</string>
+    <string name="smart_desc">Сам выберет самый быстрый сервер и включится после перезагрузки</string>
+    <string name="smart_prefix">Умное подключение: %1$s</string>
+    <string name="empty_subs">Нажмите «+», чтобы добавить подписку из буфера обмена</string>
+    <string name="action_stop">Отключить</string>
+    <string name="channel_vpn">Соединение</string>
+    <string name="cd_add">Добавить подписку из буфера</string>
+    <string name="cd_power">Включить или выключить VPN</string>
+    <plurals name="servers">
+        <item quantity="one">%d сервер</item>
+        <item quantity="few">%d сервера</item>
+        <item quantity="many">%d серверов</item>
+        <item quantity="other">%d сервера</item>
+    </plurals>
+</resources>

@@ -1,0 +1,72 @@
+name: Build release APK
+
+# Собирается ТОЛЬКО release. Debug-сборки в проекте отключены.
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Download libv2ray.aar (ядро xray)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p app/libs
+          gh release download --repo 2dust/AndroidLibXrayLite --pattern 'libv2ray.aar' --dir app/libs --clobber
+          ls -la app/libs
+
+      # Свои секреты подписи (необязательно). Без них используется постоянный ключ из app/signing/letnie.jks —
+      # подпись одна и та же в каждой сборке, поэтому обновления ставятся поверх старой версии.
+      - name: Prepare signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "LETNIE_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+            echo "LETNIE_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "LETNIE_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "LETNIE_KEY_PASSWORD=${KEY_PASSWORD:-$KEYSTORE_PASSWORD}" >> "$GITHUB_ENV"
+          else
+            echo "Секреты не заданы — подпись постоянным ключом из репозитория"
+          fi
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build release APK
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleRelease
+
+      - name: Upload APK (arm64-v8a)
+        uses: actions/upload-artifact@v4
+        with:
+          name: letnievpn-arm64-v8a
+          path: app/build/outputs/apk/release/*arm64-v8a*.apk
+          if-no-files-found: error
+
+      - name: Upload APK (universal)
+        uses: actions/upload-artifact@v4
+        with:
+          name: letnievpn-universal
+          path: app/build/outputs/apk/release/*universal*.apk
+          if-no-files-found: error

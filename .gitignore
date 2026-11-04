@@ -1,0 +1,9 @@
+.gradle/
+build/
+local.properties
+*.jks
+*.keystore
+.idea/
+*.iml
+app/libs/*.aar
+!app/signing/letnie.jks
