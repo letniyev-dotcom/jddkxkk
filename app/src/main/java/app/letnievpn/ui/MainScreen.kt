@@ -16,11 +16,9 @@ import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.ClipOp
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.TextUnit
 import kotlin.math.hypot
@@ -124,7 +122,6 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
-import androidx.compose.ui.graphics.Paint
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.StrokeCap
@@ -197,7 +194,6 @@ private fun Content(
     val subs by Repo.subs.collectAsState()
     val smart by Repo.smart.collectAsState()
     val selected by Repo.selected.collectAsState()
-    val pings by Repo.pings.collectAsState()
     val status by Repo.vpn.collectAsState()
     val vpnServer by Repo.vpnServer.collectAsState()
     val connError by Repo.connError.collectAsState()
@@ -216,7 +212,7 @@ private fun Content(
     val bottom = keep[1].dp
 
     // Читаем состояния, чтобы экран перерисовывался при их смене
-    @Suppress("UNUSED_VARIABLE") val touch = listOf(smart, selected, pings, subs)
+    @Suppress("UNUSED_VARIABLE") val touch = listOf(smart, selected, subs)
     val best = Repo.best()
     val current = Repo.current()
     val shown: Server? = if (status == VpnStatus.OFF) current
@@ -224,6 +220,13 @@ private fun Content(
 
     val scroll = rememberScrollState()
     val scope = rememberCoroutineScope()
+    // пока листаем список — пинги не публикуем: прокрутка идёт без рекомпозиций
+    LaunchedEffect(scroll) {
+        snapshotFlow { scroll.isScrollInProgress }.collect { s ->
+            Repo.holdPingsScroll = s
+            if (!s) Repo.flushPings()
+        }
+    }
     val view = LocalView.current
     // смена темы «волной» из кнопки: снимок старого экрана поверх, в нём растёт (или сжимается) круг
     var reveal by remember { mutableStateOf<Reveal?>(null) }
@@ -250,7 +253,7 @@ private fun Content(
                 onReconnect()
             }
             Spacer(Modifier.height(10.dp))
-            SubsCard(subs, best, shown, pings, if (status != VpnStatus.OFF) shown?.id else null, scroll, top, bottom, onPickAvatar) { id ->
+            SubsCard(subs, best, shown, if (status != VpnStatus.OFF) shown?.id else null, scroll, top, bottom, onPickAvatar) { id ->
                 Repo.select(id)
                 onReconnect()
             }
@@ -300,7 +303,7 @@ private fun Content(
                                     Repo.setThemeDark(toDark)
                                     scope.launch {
                                         revealT.snapTo(0f)
-                                        revealT.animateTo(1f, tween(720, easing = FastOutSlowInEasing))
+                                        revealT.animateTo(1f, tween(560, easing = FastOutSlowInEasing))
                                         reveal = null
                                     }
                                 }
@@ -346,6 +349,9 @@ private fun Content(
             Canvas(
                 Modifier
                     .fillMaxSize()
+                    // offscreen-слой: BlendMode.Clear стирает только этот холст,
+                    // под ним уже видна новая тема
+                    .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
                     .pointerInput(Unit) { detectTapGestures { } } // пока идёт анимация, нажатия не проходят
             ) {
                 val maxR = maxOf(
@@ -356,54 +362,33 @@ private fun Content(
                 )
                 val k = revealT.value
                 val radius = if (r.toDark) maxR * k else maxR * (1f - k)
-                // мягкий край из прототипа: 900 px на ширине 360 px = 2,5 ширины экрана.
-                // Снимок старой темы живёт на слое, край срезан радиальной маской с
-                // smootherstep-альфой (нулевые производные на краях) — ступеньки не видно.
-                val feather = size.width * 2.5f
-                val inner = maxOf(0f, radius - feather)
-                val from = if (radius > 0.5f) inner / radius else 0f
-                val stops = (0..32).map { i ->
-                    val u = i / 32f
-                    val a = u * u * u * (u * (u * 6 - 15) + 10)
-                    val alpha = if (r.toDark) a else 1f - a
-                    Color.Black.copy(alpha = alpha) to (from + (1f - from) * u)
-                }
-                // Низкоуровневый Canvas через нативный android.graphics.Canvas:
-                // в новых версиях Compose старый интерфейс androidx.compose.ui.graphics.Canvas
-                // (drawIntoCanvas/saveLayer/drawImageRect) удалён, а этот вариант стабилен.
-                val android = drawContext.canvas.nativeCanvas
-                val layer = android.saveLayer(0f, 0f, size.width, size.height, null)
-                android.drawBitmap(
-                    r.shot.asAndroidBitmap(),
-                    0f, 0f,
-                    android.graphics.Paint().apply {
-                        isAntiAlias = true
-                        isFilterBitmap = true
+                val feather = 900f * density // ~900 px мягкости края, как в макете
+                drawImage(r.shot, dstSize = IntSize(size.width.roundToInt(), size.height.roundToInt()))
+                when {
+                    // круг ещё не родился: весь экран — старая тема
+                    r.toDark && radius < 0.5f -> Unit
+                    // круг схлопнулся: весь экран — новая тема
+                    !r.toDark && radius < 0.5f -> drawRect(Color.Black, blendMode = BlendMode.Clear)
+                    // мягкий край: smootherstep на полосе feather, без видимой «ступеньки»
+                    else -> {
+                        val gradR = radius + feather
+                        drawCircle(
+                            brush = Brush.radialGradient(
+                                colorStops = Array(33) { i ->
+                                    val u = i / 32f
+                                    val t = u * u * u * (u * (u * 6f - 15f) + 10f) // smootherstep
+                                    val a = if (r.toDark) 1f - t else t // в «дырке» — новая тема
+                                    (((radius - feather + feather * u) / gradR).coerceIn(0f, 1f)) to
+                                        Color.Black.copy(alpha = a)
+                                },
+                                center = r.center,
+                                radius = gradR
+                            ),
+                            radius = gradR,
+                            blendMode = BlendMode.Clear
+                        )
                     }
-                )
-                val gradientPaint = android.graphics.Paint().apply {
-                    isAntiAlias = true
-                    shader = android.graphics.RadialGradient(
-                        r.center.x,
-                        r.center.y,
-                        radius.coerceAtLeast(1f),
-                        IntArray(33) { i ->
-                            val u = i / 32f
-                            val a = u * u * u * (u * (u * 6 - 15) + 10)
-                            val alpha = if (r.toDark) a else 1f - a
-                            android.graphics.Color.argb(
-                                (alpha * 255).roundToInt().coerceIn(0, 255), 0, 0, 0
-                            )
-                        },
-                        FloatArray(33) { i -> from + (1f - from) * (i / 32f) },
-                        android.graphics.Shader.TileMode.CLAMP
-                    )
-                    xfermode = android.graphics.PorterDuffXfermode(
-                        android.graphics.PorterDuff.Mode.DST_IN
-                    )
                 }
-                android.drawRect(0f, 0f, size.width, size.height, gradientPaint)
-                android.restoreToCount(layer)
             }
         }
     }
@@ -455,9 +440,8 @@ private fun PowerBlock(
     connError: String,
     onPower: () -> Unit,
 ) {
-    // пинг текущего сервера читаем из его собственного потока: шапка не реагирует
-    // на пакеты замеров всей сотни серверов
-    val shownPing = if (shown != null) Repo.pingFlow(shown.id).collectAsState().value else null
+    // вся карта пингов читается только здесь: перерисовывается один блок, а не весь экран
+    val pings by Repo.pings.collectAsState()
     val p = LocalPalette.current
     val on = status == VpnStatus.ON
     val active = status != VpnStatus.OFF
@@ -517,11 +501,14 @@ private fun PowerBlock(
             status == VpnStatus.OFF && connError.isNotBlank() -> "Не подключилось: $connError"
             shown == null -> stringResource(R.string.hint_tap)
             status == VpnStatus.OFF && smart -> stringResource(R.string.smart_prefix, shown.name)
+            status == VpnStatus.ON -> {
+                // реальная задержка через туннель, пока она замерена; иначе пинг до сервера
+                val ms = tunnelMs.takeIf { it > 0 } ?: pings[shown.id]
+                shown.name
+            }
             else -> shown.name
         }
-        // реальная задержка через туннель, пока она замерена; иначе пинг до сервера
-        val liveMs = if (status == VpnStatus.ON && shown != null)
-            (tunnelMs.takeIf { it > 0 } ?: shownPing?.takeIf { it > 0 }) else null
+        val liveMs = if (status == VpnStatus.ON && shown != null) (tunnelMs.takeIf { it > 0 } ?: pings[shown.id]) else null
         if (liveMs != null && liveMs > 0 && shown != null) {
             Row(
                 Modifier.padding(top = 2.dp, start = 24.dp, end = 24.dp),
@@ -655,7 +642,6 @@ private fun SubsCard(
     subs: List<Sub>,
     best: Server?,
     current: Server?,
-    pings: Map<String, Int>,
     /** Сервер, к которому сейчас подключены: остаётся в списке, даже если пинг не прошёл. */
     keepId: String?,
     scroll: ScrollState,
@@ -819,7 +805,7 @@ private fun SubsCard(
                 val lifted = dragId == id
                 val lift by animateFloatAsState(if (lifted) 1.02f else 1f, tween(160), label = "lift")
                 // недоступные серверы (пинг не прошёл) скрываются сами и возвращаются, когда снова отвечают
-                val shownCount = sub.servers.count { pings[it.id] != -1 || it.id == keepId }
+                val shownCount = sub.servers.count { cellPing(it.id) != -1 || it.id == keepId }
                 val closed = sub.id !in opened
                 // состояние читаем только в graphicsLayer: во время анимации экран не перекомпонуется
                 val rot = animateFloatAsState(if (closed) -90f else 0f, tween(320, easing = FastOutSlowInEasing), label = "chev")
@@ -900,13 +886,9 @@ private fun SubsCard(
                             // серверы без ответа уходят и возвращаются плавно, а не рывком
                             sub.servers.forEach { s ->
                                 key(s.id) {
-                                    // лямбда одна на сервер: пока приходят пачки пингов соседей,
-                                    // эта строка пропускает рекомпозицию целиком
-                                    val pick = remember(s.id) { { onPick(s.id) } }
                                     ServerSlot(
-                                        s, s.id == current?.id, s.id == best?.id,
-                                        pings[s.id] != -1 || s.id == keepId, pick
-                                    )
+                                        s, s.id == current?.id, s.id == best?.id, keepId
+                                    ) { onPick(s.id) }
                                 }
                             }
                             Spacer(Modifier.height(4.dp))
@@ -988,16 +970,22 @@ private fun Avatar(sub: Sub, onClick: () -> Unit) {
 
 /** Строка сервера, которая плавно сворачивается, когда сервер не отвечает, и так же плавно возвращается. */
 @Composable
-private fun ServerSlot(s: Server, selected: Boolean, best: Boolean, keepVisible: Boolean, onClick: () -> Unit) {
-    // пинг из собственного потока сервера: строка пересобирается, только когда изменилось её число,
-    // а не все 100 строк дважды в секунду — прокрутка перестаёт лагать
-    val ping by Repo.pingFlow(s.id).collectAsState()
+private fun ServerSlot(s: Server, selected: Boolean, best: Boolean, keepId: String?, onClick: () -> Unit) {
+    // строка подписана только на свой пинг: перерисуется при смене её значения, а не всей карты
+    val ping by Repo.pingOf(s.id).collectAsState()
     // пока строка уходит, оставляем последний рабочий пинг, а не «—»
-    val last = remember { arrayOf(ping) }
-    if (ping != null && ping != -1) last[0] = ping
-    Collapsible(expanded = keepVisible) {
-        ServerRow(s, selected, best, if (ping == -1) last[0] else ping, onClick)
+    val last = remember { arrayOf<Int?>(null) }
+    if (ping != -1 && ping != -2) last[0] = ping
+    Collapsible(expanded = ping != -1 || s.id == keepId) {
+        ServerRow(s, selected, best, if (ping == -1) last[0] else ping.takeIf { it != -2 }, onClick)
     }
+}
+
+/** Подписка только на пинг конкретного сервера (для счётчиков в заголовках подписок). */
+@Composable
+private fun cellPing(id: String): Int {
+    val v by Repo.pingOf(id).collectAsState()
+    return v
 }
 
 @Composable

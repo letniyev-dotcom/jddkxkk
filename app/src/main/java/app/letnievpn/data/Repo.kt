@@ -51,6 +51,17 @@ object Repo {
 
     /** пинг в мс по id сервера; -1 — недоступен */
     val pings = MutableStateFlow<Map<String, Int>>(emptyMap())
+
+    /** Персональный канал пинга сервера: строка перерисуется, только когда изменилось её значение. */
+    private val pingCells = ConcurrentHashMap<String, MutableStateFlow<Int>>()
+
+    /** Подписка на пинг одного сервера (для строк списка). */
+    fun pingOf(id: String): StateFlow<Int> =
+        pingCells.getOrPut(id) { MutableStateFlow(pings.value[id] ?: -2) } // -2 — ещё не меряли
+
+    private fun pushCell(id: String, value: Int) {
+        pingCells.getOrPut(id) { MutableStateFlow(value) }.let { if (it.value != value) it.value = value }
+    }
     val vpn = MutableStateFlow(VpnStatus.OFF)
 
     /** реальная задержка через туннель, мс (пока VPN включён и приложение открыто); -1 — нет данных */
@@ -184,11 +195,6 @@ object Repo {
     // Поэтому замеры копим и публикуем пачкой раз в ~0,5 с, а на время перетаскивания — держим.
 
     private val latestPing = ConcurrentHashMap<String, Int>()
-
-    // отдельный поток на каждый сервер: строка списка пересобирается только при смене её пинга,
-    // а не все строки при каждом пакете замеров (со 100 серверами прокрутка лагала)
-    private val pingFlows = ConcurrentHashMap<String, MutableStateFlow<Int?>>()
-    fun pingFlow(id: String): StateFlow<Int?> = pingFlows.getOrPut(id) { MutableStateFlow(pings.value[id]) }
     private val pendingPings = HashMap<String, Int>()
     private val pingLock = Any()
     private var flushJob: Job? = null
@@ -197,7 +203,15 @@ object Repo {
     @Volatile
     var holdPings = false
 
+    /** true, пока основной список листают: пинги не публикуем, чтобы прокрутка шла без рывков. */
+    @Volatile
+    var holdPingsScroll = false
+
+    private fun pingsHeld() = holdPings || holdPingsScroll
+
     private fun publishPing(id: String, value: Int) {
+        // на время прокрутки экран не трогаем: замеры копятся и выйдут одной пачкой на отпускании
+        if (!pingsHeld()) pushCell(id, value)
         synchronized(pingLock) {
             pendingPings[id] = value
             if (flushJob?.isActive != true) {
@@ -211,7 +225,7 @@ object Repo {
 
     /** Выдаёт накопленные замеры в pings одним обновлением. Во время перетаскивания ничего не делает. */
     fun flushPings() {
-        if (holdPings) {
+        if (pingsHeld()) {
             // повторим позже, когда отпустят
             synchronized(pingLock) {
                 if (pendingPings.isNotEmpty() && flushJob?.isActive != true) {
@@ -228,11 +242,13 @@ object Repo {
             pendingPings.clear()
             c
         }
-        // неизменившиеся пропускаем: без лишних копий карты и рекомпозиций всего экрана
-        val changed = batch.filter { (id, v) -> pings.value[id] != v }
-        if (changed.isEmpty()) return
-        pings.value = pings.value + changed
-        changed.forEach { (id, v) -> pingFlows[id]?.value = v }
+        if (batch.isNotEmpty()) {
+            batch.forEach { (id, v) -> pushCell(id, v) }
+            pings.update { prev ->
+                val changed = batch.filter { e -> prev[e.key] != e.value }
+                if (changed.isEmpty()) prev else prev + changed
+            }
+        }
     }
 
     /** Один замер сервера с записью в pings. Одиночный сбой не сбрасывает показание: «—» только после двух подряд. */
