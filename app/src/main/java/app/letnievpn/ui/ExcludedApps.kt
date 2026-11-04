@@ -298,16 +298,17 @@ fun BoxScopeHeaderMenu(mode: Int, onMode: (Int) -> Unit, onAdd: () -> Unit) {
                             // кнопка -> меню: обычное скругление
                             shape = MorphShape(g.rect(tt), 24f.dp.toPx(), 1f)
                         } else {
-                            // меню -> окно; дальше окно «докуется» к краям при прокрутке списка
+                            // меню -> окно: как раньше, плавный перелёт (lerp), но финальный прямоугольник
+                            // «докуется» к краям при прокрутке списка
                             val w = (tt - 1f).coerceIn(0f, 1f)
                             val dk = dock.value
                             val side0 = 6f.dp.toPx()
-                            val wr = Rect(
+                            val target = Rect(
                                 Offset(side0 * (1f - dk), g.win.top),
                                 Size(g.win.width + 2f * side0 * dk, g.win.height + 8f.dp.toPx() * dk)
                             )
                             val r = (24f + (46f - 24f) * w).dp.toPx()
-                            shape = WindowShape(wr, r, r * (1f - dk), 1f + 0.7f * w)
+                            shape = WindowShape(lerp(g.menu, target, w), r, r * (1f - dk), 1f + 0.7f * w)
                         }
                         clip = true
                         alpha = (tt / 0.15f).coerceIn(0f, 1f)

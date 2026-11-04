@@ -369,17 +369,18 @@ private fun Content(
                     r.toDark && radius < 0.5f -> Unit
                     // круг схлопнулся: весь экран — новая тема
                     !r.toDark && radius < 0.5f -> drawRect(Color.Black, blendMode = BlendMode.Clear)
-                    // мягкий край: smootherstep на полосе feather, без видимой «ступеньки»
+                    // мягкий край: альфа как функция расстояния от центра — полоса [radius-feather, radius+feather]
+                    // (позиции стопов идут от 0 до 1 без схлопывания при любом радиусе)
                     else -> {
-                        val gradR = radius + feather
+                        val gradR = maxR + feather
                         drawCircle(
                             brush = Brush.radialGradient(
                                 colorStops = Array(33) { i ->
                                     val u = i / 32f
-                                    val t = u * u * u * (u * (u * 6f - 15f) + 10f) // smootherstep
+                                    val d = gradR * u
+                                    val t = smootherstep01(((d - radius + feather) / (2f * feather)).coerceIn(0f, 1f))
                                     val a = if (r.toDark) 1f - t else t // в «дырке» — новая тема
-                                    (((radius - feather + feather * u) / gradR).coerceIn(0f, 1f)) to
-                                        Color.Black.copy(alpha = a)
+                                    u to Color.Black.copy(alpha = a)
                                 },
                                 center = r.center,
                                 radius = gradR
@@ -393,6 +394,9 @@ private fun Content(
         }
     }
 }
+
+/** smootherstep: нулевые 1-я и 2-я производные на краях — у мягкого края нет «ступеньки». */
+private fun smootherstep01(u: Float): Float = u * u * u * (u * (u * 6f - 15f) + 10f)
 
 private class Reveal(val shot: ImageBitmap, val center: Offset, val toDark: Boolean)
 
