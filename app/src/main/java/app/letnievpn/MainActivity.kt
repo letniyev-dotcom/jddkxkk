@@ -29,31 +29,9 @@ class MainActivity : ComponentActivity() {
     /** Плитка шторки просит включить VPN, но нужно разрешение — просим его уже здесь. */
     private val connectRequest = mutableStateOf(false)
 
-    /** Старт VPN отложен до onResume: окно уже на экране и системный запрос ложится поверх приложения. */
-    private val pendingConnect = mutableStateOf(false)
-
-    @Volatile
-    private var resumed = false
-
     override fun onStart() {
         super.onStart()
         Repo.startLivePing()
-    }
-
-    override fun onResume() {
-        super.onResume()
-        resumed = true
-        // только теперь, когда окно гарантированно показано, иначе системный запрос
-        // на разрешение VPN (это активность «Настроек») всплывает вместо приложения
-        if (connectRequest.value) {
-            connectRequest.value = false
-            pendingConnect.value = true
-        }
-    }
-
-    override fun onPause() {
-        resumed = false
-        super.onPause()
     }
 
     override fun onStop() {
@@ -64,9 +42,7 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        if (intent.action == ACTION_CONNECT) {
-            if (resumed) pendingConnect.value = true else connectRequest.value = true
-        }
+        if (intent.action == ACTION_CONNECT) connectRequest.value = true
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -81,9 +57,7 @@ class MainActivity : ComponentActivity() {
         }
         // тихо обновляем подписки и пинги при открытии
         Repo.refreshSubscriptions()
-        if (intent?.action == ACTION_CONNECT) {
-            if (resumed) pendingConnect.value = true else connectRequest.value = true
-        }
+        if (intent?.action == ACTION_CONNECT) connectRequest.value = true
 
         setContent {
             // 0 — ничего не ждём; иначе после выдачи разрешений включаем VPN
@@ -136,11 +110,9 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // подключаем VPN только после onResume: системный диалог всегда поверх приложения
-            val pendingConnectNow by pendingConnect
-            LaunchedEffect(pendingConnectNow) {
-                if (pendingConnectNow) {
-                    pendingConnect.value = false
+            LaunchedEffect(connectRequest.value) {
+                if (connectRequest.value) {
+                    connectRequest.value = false
                     if (Repo.vpn.value == VpnStatus.OFF) startVpn()
                 }
             }

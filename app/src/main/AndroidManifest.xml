@@ -35,6 +35,12 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- Долгое нажатие на плитку в шторке: система ищет в приложении экран «настроек плитки».
+                 Без этого фильтра она открывает системные настройки приложения вместо самого приложения. -->
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE_PREFERENCES" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
         </activity>
 
         <service

@@ -14,7 +14,6 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.runtime.SideEffect
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.ClipOp
-import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.clipPath
@@ -119,6 +118,7 @@ import kotlin.math.roundToInt
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
@@ -143,7 +143,16 @@ import app.letnievpn.data.Repo
 import app.letnievpn.data.Server
 import app.letnievpn.data.Sub
 import app.letnievpn.data.VpnStatus
+import androidx.compose.runtime.State
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+
+/** Сервер с самым низким пингом (то же, что Repo.best, но по переданным данным). */
+private fun bestOf(subs: List<Sub>, pg: Map<String, Int>): Server? {
+    val all = subs.flatMap { it.servers }
+    return all.filter { (pg[it.id] ?: -1) > 0 }.minByOrNull { pg[it.id]!! } ?: all.firstOrNull()
+}
 
 @Composable
 fun MainScreen(onPower: () -> Unit, onReconnect: () -> Unit, onPickAvatar: (String) -> Unit) {
@@ -194,10 +203,12 @@ private fun Content(
     val subs by Repo.subs.collectAsState()
     val smart by Repo.smart.collectAsState()
     val selected by Repo.selected.collectAsState()
+    // пинги НЕ читаем здесь: держим как State и читаем только в тех местах, которым они нужны
+    val pingsState = Repo.pings.collectAsState()
     val status by Repo.vpn.collectAsState()
     val vpnServer by Repo.vpnServer.collectAsState()
     val connError by Repo.connError.collectAsState()
-    val tunnelMs by Repo.tunnelDelay.collectAsState()
+    val tunnelState = Repo.tunnelDelay.collectAsState()
 
     // Отступы под системные панели берём «независимо от видимости» и запоминаем наибольшие:
     // при смахивании в панель задач система на миг обнуляет статус-бар и навигацию,
@@ -213,20 +224,22 @@ private fun Content(
 
     // Читаем состояния, чтобы экран перерисовывался при их смене
     @Suppress("UNUSED_VARIABLE") val touch = listOf(smart, selected, subs)
-    val best = Repo.best()
-    val current = Repo.current()
-    val shown: Server? = if (status == VpnStatus.OFF) current
-    else subs.flatMap { it.servers }.firstOrNull { it.id == vpnServer } ?: current
+    // лучший / текущий / показанный сервер зависят от пингов, но считаются как derived-состояния:
+    // экран перерисовывается только когда меняется сам сервер, а не каждое показание пинга
+    val bestId = remember(subs) { derivedStateOf { bestOf(subs, pingsState.value)?.id } }
+    val shownState = remember(subs, smart, selected, status, vpnServer) {
+        derivedStateOf {
+            val all = subs.flatMap { it.servers }
+            val cur = if (smart) all.firstOrNull { it.id == bestId.value }
+            else all.firstOrNull { it.id == selected } ?: all.firstOrNull { it.id == bestId.value }
+            val fallback = cur ?: all.firstOrNull()
+            if (status == VpnStatus.OFF) fallback else all.firstOrNull { it.id == vpnServer } ?: fallback
+        }
+    }
+    val keepId = remember(status) { derivedStateOf { if (status != VpnStatus.OFF) shownState.value?.id else null } }
 
     val scroll = rememberScrollState()
     val scope = rememberCoroutineScope()
-    // пока листаем список — пинги не публикуем: прокрутка идёт без рекомпозиций
-    LaunchedEffect(scroll) {
-        snapshotFlow { scroll.isScrollInProgress }.collect { s ->
-            Repo.holdPingsScroll = s
-            if (!s) Repo.flushPings()
-        }
-    }
     val view = LocalView.current
     // смена темы «волной» из кнопки: снимок старого экрана поверх, в нём растёт (или сжимается) круг
     var reveal by remember { mutableStateOf<Reveal?>(null) }
@@ -242,18 +255,18 @@ private fun Content(
                 .verticalScroll(scroll)
                 .padding(top = top + 56.dp, bottom = bottom + 28.dp, start = 12.dp, end = 12.dp)
         ) {
-            PowerBlock(status, shown, smart, tunnelMs, connError, onPower)
+            PowerBlock(status, shownState, smart, pingsState, tunnelState, connError, onPower)
             SmartCard(smart) {
                 if (smart) {
                     Repo.setSmart(false)
-                    if (Repo.selected.value == null) Repo.selected.value = best?.id
+                    if (Repo.selected.value == null) Repo.selected.value = bestId.value
                 } else {
                     Repo.setSmart(true)
                 }
                 onReconnect()
             }
             Spacer(Modifier.height(10.dp))
-            SubsCard(subs, best, shown, if (status != VpnStatus.OFF) shown?.id else null, scroll, top, bottom, onPickAvatar) { id ->
+            SubsCard(subs, bestId, shownState, pingsState, keepId, scroll, top, bottom, onPickAvatar) { id ->
                 Repo.select(id)
                 onReconnect()
             }
@@ -303,7 +316,7 @@ private fun Content(
                                     Repo.setThemeDark(toDark)
                                     scope.launch {
                                         revealT.snapTo(0f)
-                                        revealT.animateTo(1f, tween(560, easing = FastOutSlowInEasing))
+                                        revealT.animateTo(1f, tween(950, easing = REVEAL_EASING))
                                         reveal = null
                                     }
                                 }
@@ -349,8 +362,6 @@ private fun Content(
             Canvas(
                 Modifier
                     .fillMaxSize()
-                    // offscreen-слой: BlendMode.Clear стирает только этот холст,
-                    // под ним уже видна новая тема
                     .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
                     .pointerInput(Unit) { detectTapGestures { } } // пока идёт анимация, нажатия не проходят
             ) {
@@ -361,42 +372,32 @@ private fun Content(
                     hypot(size.width - r.center.x, size.height - r.center.y),
                 )
                 val k = revealT.value
-                val radius = if (r.toDark) maxR * k else maxR * (1f - k)
-                val feather = 900f * density // ~900 px мягкости края, как в макете
-                drawImage(r.shot, dstSize = IntSize(size.width.roundToInt(), size.height.roundToInt()))
-                when {
-                    // круг ещё не родился: весь экран — старая тема
-                    r.toDark && radius < 0.5f -> Unit
-                    // круг схлопнулся: весь экран — новая тема
-                    !r.toDark && radius < 0.5f -> drawRect(Color.Black, blendMode = BlendMode.Clear)
-                    // мягкий край: альфа как функция расстояния от центра — полоса [radius-feather, radius+feather]
-                    // (позиции стопов идут от 0 до 1 без схлопывания при любом радиусе)
-                    else -> {
-                        val gradR = maxR + feather
-                        drawCircle(
-                            brush = Brush.radialGradient(
-                                colorStops = Array(33) { i ->
-                                    val u = i / 32f
-                                    val d = gradR * u
-                                    val t = smootherstep01(((d - radius + feather) / (2f * feather)).coerceIn(0f, 1f))
-                                    val a = if (r.toDark) 1f - t else t // в «дырке» — новая тема
-                                    u to Color.Black.copy(alpha = a)
-                                },
-                                center = r.center,
-                                radius = gradR
-                            ),
-                            radius = gradR,
-                            blendMode = BlendMode.Clear
-                        )
-                    }
+                // край волны — широкая полоса плавного перехода (900 dp), без видимой границы.
+                // Кривая smootherstep: нулевые первая и вторая производные на краях полосы.
+                val f = 900.dp.toPx()
+                val total = maxR + f
+                val radius = if (r.toDark) total * k else total * (1f - k)
+                val u0 = ((f - radius) / f).coerceIn(0f, 1f)
+                val n = 32
+                val stops = Array(n + 1) { i ->
+                    val u = u0 + (1f - u0) * i / n
+                    val a = u * u * u * (u * (u * 6f - 15f) + 10f)
+                    val alpha = if (r.toDark) a else 1f - a
+                    val x = (radius - f + f * u).coerceIn(0f, total)
+                    (x / total) to Color.Black.copy(alpha = alpha)
                 }
+                // снимок старой темы рисуем в отдельном слое и «стираем» его градиентной маской
+                drawImage(r.shot, dstSize = IntSize(size.width.roundToInt(), size.height.roundToInt()))
+                drawRect(
+                    brush = Brush.radialGradient(colorStops = stops, center = r.center, radius = total),
+                    blendMode = BlendMode.DstIn
+                )
             }
         }
     }
 }
 
-/** smootherstep: нулевые 1-я и 2-я производные на краях — у мягкого края нет «ступеньки». */
-private fun smootherstep01(u: Float): Float = u * u * u * (u * (u * 6f - 15f) + 10f)
+private val REVEAL_EASING = androidx.compose.animation.core.CubicBezierEasing(0.65f, 0f, 0.35f, 1f)
 
 private class Reveal(val shot: ImageBitmap, val center: Offset, val toDark: Boolean)
 
@@ -438,15 +439,18 @@ private fun readClipboard(ctx: Context): String = try {
 @Composable
 private fun PowerBlock(
     status: VpnStatus,
-    shown: Server?,
+    shownState: State<Server?>,
     smart: Boolean,
-    tunnelMs: Int,
+    pings: State<Map<String, Int>>,
+    tunnelState: State<Int>,
     connError: String,
     onPower: () -> Unit,
 ) {
-    // вся карта пингов читается только здесь: перерисовывается один блок, а не весь экран
-    val pings by Repo.pings.collectAsState()
     val p = LocalPalette.current
+    val shown = shownState.value
+    val tunnelMs = tunnelState.value
+    // пинг показанного сервера: блок перерисовывается, только когда меняется именно это число
+    val shownPing = remember(shown?.id) { derivedStateOf { shown?.id?.let { pings.value[it] } } }.value
     val on = status == VpnStatus.ON
     val active = status != VpnStatus.OFF
 
@@ -507,12 +511,11 @@ private fun PowerBlock(
             status == VpnStatus.OFF && smart -> stringResource(R.string.smart_prefix, shown.name)
             status == VpnStatus.ON -> {
                 // реальная задержка через туннель, пока она замерена; иначе пинг до сервера
-                val ms = tunnelMs.takeIf { it > 0 } ?: pings[shown.id]
                 shown.name
             }
             else -> shown.name
         }
-        val liveMs = if (status == VpnStatus.ON && shown != null) (tunnelMs.takeIf { it > 0 } ?: pings[shown.id]) else null
+        val liveMs = if (status == VpnStatus.ON && shown != null) (tunnelMs.takeIf { it > 0 } ?: shownPing) else null
         if (liveMs != null && liveMs > 0 && shown != null) {
             Row(
                 Modifier.padding(top = 2.dp, start = 24.dp, end = 24.dp),
@@ -644,10 +647,11 @@ private fun Switch(on: Boolean, onToggle: () -> Unit) {
 @Composable
 private fun SubsCard(
     subs: List<Sub>,
-    best: Server?,
-    current: Server?,
+    bestId: State<String?>,
+    shownId: State<Server?>,
+    pings: State<Map<String, Int>>,
     /** Сервер, к которому сейчас подключены: остаётся в списке, даже если пинг не прошёл. */
-    keepId: String?,
+    keepId: State<String?>,
     scroll: ScrollState,
     top: Dp,
     bottom: Dp,
@@ -762,6 +766,18 @@ private fun SubsCard(
         Repo.holdPings = dragging
         if (!dragging) Repo.flushPings()
     }
+    // и пока список прокручивается пальцем или «летит» по инерции: замеры копятся и выдаются сразу после остановки
+    LaunchedEffect(scroll) {
+        snapshotFlow { scroll.isScrollInProgress }.collectLatest { moving ->
+            if (moving) {
+                Repo.holdScroll = true
+            } else {
+                delay(120)
+                Repo.holdScroll = false
+                Repo.flushPings()
+            }
+        }
+    }
 
     LaunchedEffect(dragId) {
         if (dragId == null) return@LaunchedEffect
@@ -809,7 +825,6 @@ private fun SubsCard(
                 val lifted = dragId == id
                 val lift by animateFloatAsState(if (lifted) 1.02f else 1f, tween(160), label = "lift")
                 // недоступные серверы (пинг не прошёл) скрываются сами и возвращаются, когда снова отвечают
-                val shownCount = sub.servers.count { cellPing(it.id) != -1 || it.id == keepId }
                 val closed = sub.id !in opened
                 // состояние читаем только в graphicsLayer: во время анимации экран не перекомпонуется
                 val rot = animateFloatAsState(if (closed) -90f else 0f, tween(320, easing = FastOutSlowInEasing), label = "chev")
@@ -876,12 +891,7 @@ private fun SubsCard(
                                 sub.name, color = p.text, fontSize = 15.sp, fontWeight = FontWeight.Medium,
                                 maxLines = 1, overflow = TextOverflow.Ellipsis
                             )
-                            val n = res.getQuantityString(R.plurals.servers, shownCount, shownCount)
-                            Text(
-                                if (sub.info.isBlank()) n else "$n · ${sub.info}",
-                                color = p.text2, fontSize = 12.sp, lineHeight = 16.sp,
-                                maxLines = 1, overflow = TextOverflow.Ellipsis
-                            )
+                            SubInfoLine(sub, pings, keepId)
                         }
                         Box(Modifier.graphicsLayer { rotationZ = rot.value }) { PolyIcon(CHEVRON, p.text2, 22.dp) }
                     }
@@ -890,9 +900,7 @@ private fun SubsCard(
                             // серверы без ответа уходят и возвращаются плавно, а не рывком
                             sub.servers.forEach { s ->
                                 key(s.id) {
-                                    ServerSlot(
-                                        s, s.id == current?.id, s.id == best?.id, keepId
-                                    ) { onPick(s.id) }
+                                    ServerSlot(s, shownId, bestId, pings, keepId) { onPick(s.id) }
                                 }
                             }
                             Spacer(Modifier.height(4.dp))
@@ -972,24 +980,46 @@ private fun Avatar(sub: Sub, onClick: () -> Unit) {
     }
 }
 
-/** Строка сервера, которая плавно сворачивается, когда сервер не отвечает, и так же плавно возвращается. */
+/** Строка «N серверов · инфо»: сама следит за числом доступных серверов, остальной экран не трогает. */
 @Composable
-private fun ServerSlot(s: Server, selected: Boolean, best: Boolean, keepId: String?, onClick: () -> Unit) {
-    // строка подписана только на свой пинг: перерисуется при смене её значения, а не всей карты
-    val ping by Repo.pingOf(s.id).collectAsState()
-    // пока строка уходит, оставляем последний рабочий пинг, а не «—»
-    val last = remember { arrayOf<Int?>(null) }
-    if (ping != -1 && ping != -2) last[0] = ping
-    Collapsible(expanded = ping != -1 || s.id == keepId) {
-        ServerRow(s, selected, best, if (ping == -1) last[0] else ping.takeIf { it != -2 }, onClick)
+private fun SubInfoLine(sub: Sub, pings: State<Map<String, Int>>, keepId: State<String?>) {
+    val p = LocalPalette.current
+    val res = LocalContext.current.resources
+    val count by remember(sub) {
+        derivedStateOf { sub.servers.count { pings.value[it.id] != -1 || it.id == keepId.value } }
     }
+    val n = res.getQuantityString(R.plurals.servers, count, count)
+    Text(
+        if (sub.info.isBlank()) n else "$n · ${sub.info}",
+        color = p.text2, fontSize = 12.sp, lineHeight = 16.sp,
+        maxLines = 1, overflow = TextOverflow.Ellipsis
+    )
 }
 
-/** Подписка только на пинг конкретного сервера (для счётчиков в заголовках подписок). */
+/**
+ * Строка сервера, которая плавно сворачивается, когда сервер не отвечает, и так же плавно возвращается.
+ * Каждая строка читает только свой пинг: при новой пачке замеров перерисовываются лишь те строки,
+ * у которых число действительно изменилось.
+ */
 @Composable
-private fun cellPing(id: String): Int {
-    val v by Repo.pingOf(id).collectAsState()
-    return v
+private fun ServerSlot(
+    s: Server,
+    shownId: State<Server?>,
+    bestId: State<String?>,
+    pings: State<Map<String, Int>>,
+    keepId: State<String?>,
+    onClick: () -> Unit,
+) {
+    val ping by remember(s.id) { derivedStateOf { pings.value[s.id] } }
+    val selected by remember(s.id) { derivedStateOf { shownId.value?.id == s.id } }
+    val best by remember(s.id) { derivedStateOf { bestId.value == s.id } }
+    val visible = ping != -1 || s.id == keepId.value
+    // пока строка уходит, оставляем последний рабочий пинг, а не «—»
+    val last = remember { arrayOf(ping) }
+    if (ping != -1) last[0] = ping
+    Collapsible(expanded = visible) {
+        ServerRow(s, selected, best, if (ping == -1) last[0] else ping, onClick)
+    }
 }
 
 @Composable

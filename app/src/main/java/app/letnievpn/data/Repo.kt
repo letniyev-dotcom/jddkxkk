@@ -20,7 +20,6 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -51,17 +50,6 @@ object Repo {
 
     /** пинг в мс по id сервера; -1 — недоступен */
     val pings = MutableStateFlow<Map<String, Int>>(emptyMap())
-
-    /** Персональный канал пинга сервера: строка перерисуется, только когда изменилось её значение. */
-    private val pingCells = ConcurrentHashMap<String, MutableStateFlow<Int>>()
-
-    /** Подписка на пинг одного сервера (для строк списка). */
-    fun pingOf(id: String): StateFlow<Int> =
-        pingCells.getOrPut(id) { MutableStateFlow(pings.value[id] ?: -2) } // -2 — ещё не меряли
-
-    private fun pushCell(id: String, value: Int) {
-        pingCells.getOrPut(id) { MutableStateFlow(value) }.let { if (it.value != value) it.value = value }
-    }
     val vpn = MutableStateFlow(VpnStatus.OFF)
 
     /** реальная задержка через туннель, мс (пока VPN включён и приложение открыто); -1 — нет данных */
@@ -203,15 +191,11 @@ object Repo {
     @Volatile
     var holdPings = false
 
-    /** true, пока основной список листают: пинги не публикуем, чтобы прокрутка шла без рывков. */
+    /** true, пока список на экране прокручивается: так же держим замеры, чтобы прокрутка не лагала. */
     @Volatile
-    var holdPingsScroll = false
-
-    private fun pingsHeld() = holdPings || holdPingsScroll
+    var holdScroll = false
 
     private fun publishPing(id: String, value: Int) {
-        // на время прокрутки экран не трогаем: замеры копятся и выйдут одной пачкой на отпускании
-        if (!pingsHeld()) pushCell(id, value)
         synchronized(pingLock) {
             pendingPings[id] = value
             if (flushJob?.isActive != true) {
@@ -225,7 +209,7 @@ object Repo {
 
     /** Выдаёт накопленные замеры в pings одним обновлением. Во время перетаскивания ничего не делает. */
     fun flushPings() {
-        if (pingsHeld()) {
+        if (holdPings || holdScroll) {
             // повторим позже, когда отпустят
             synchronized(pingLock) {
                 if (pendingPings.isNotEmpty() && flushJob?.isActive != true) {
@@ -242,13 +226,7 @@ object Repo {
             pendingPings.clear()
             c
         }
-        if (batch.isNotEmpty()) {
-            batch.forEach { (id, v) -> pushCell(id, v) }
-            pings.update { prev ->
-                val changed = batch.filter { e -> prev[e.key] != e.value }
-                if (changed.isEmpty()) prev else prev + changed
-            }
-        }
+        if (batch.isNotEmpty()) pings.update { it + batch }
     }
 
     /** Один замер сервера с записью в pings. Одиночный сбой не сбрасывает показание: «—» только после двух подряд. */

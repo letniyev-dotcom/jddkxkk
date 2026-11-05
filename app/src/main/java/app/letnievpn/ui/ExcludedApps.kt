@@ -4,6 +4,10 @@ import android.content.Context
 import android.content.Intent
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.Animatable
+import kotlinx.coroutines.flow.collectLatest
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.AnimationVector1D
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -58,7 +62,6 @@ import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -135,8 +138,10 @@ private fun cs(t: Float, e: Float) = cos(t).coerceIn(0f, 1f).pow(e)
  * Контур со скруглением-суперэллипсом: при k = 1 это обычная дуга окружности (как у самого меню),
  * при k = 1.7 — «непрерывное» скругление как в iOS (как у окна). Между ними форма перетекает плавно.
  */
-private fun squirclePath(l: Float, t: Float, rt: Float, b: Float, radius: Float, k: Float): Path {
-    val r = minOf(radius, (rt - l) / 2f, (b - t) / 2f).coerceAtLeast(0f)
+private fun squirclePath(l: Float, t: Float, rt: Float, b: Float, radius: Float, k: Float, bottomRadius: Float = radius): Path {
+    val half = minOf((rt - l) / 2f, (b - t) / 2f)
+    val r = minOf(radius, half).coerceAtLeast(0f)
+    val rb = minOf(bottomRadius, half).coerceAtLeast(0f)
     val e = 2f / 2f.pow(k)
     val steps = 28
     val path = Path()
@@ -146,15 +151,15 @@ private fun squirclePath(l: Float, t: Float, rt: Float, b: Float, radius: Float,
         val a = i / steps.toFloat() * (PI / 2).toFloat()
         path.lineTo(rt - r + r * sn(a, e), t + r - r * cs(a, e))
     }
-    path.lineTo(rt, b - r)
+    path.lineTo(rt, b - rb)
     for (i in 1..steps) {
         val a = i / steps.toFloat() * (PI / 2).toFloat()
-        path.lineTo(rt - r + r * cs(a, e), b - r + r * sn(a, e))
+        path.lineTo(rt - rb + rb * cs(a, e), b - rb + rb * sn(a, e))
     }
-    path.lineTo(l + r, b)
+    path.lineTo(l + rb, b)
     for (i in 1..steps) {
         val a = i / steps.toFloat() * (PI / 2).toFloat()
-        path.lineTo(l + r - r * sn(a, e), b - r + r * cs(a, e))
+        path.lineTo(l + rb - rb * sn(a, e), b - rb + rb * cs(a, e))
     }
     path.lineTo(l, t + r)
     for (i in 1..steps) {
@@ -165,55 +170,30 @@ private fun squirclePath(l: Float, t: Float, rt: Float, b: Float, radius: Float,
     return path
 }
 
-private class MorphShape(private val rect: Rect, private val radius: Float, private val k: Float) : Shape {
+private class MorphShape(
+    private val rect: Rect,
+    private val radius: Float,
+    private val k: Float,
+    private val bottomRadius: Float = radius,
+) : Shape {
     override fun createOutline(size: Size, layoutDirection: LayoutDirection, density: Density): Outline =
-        Outline.Generic(squirclePath(rect.left, rect.top, rect.right, rect.bottom, radius, k))
-}
-
-/**
- * Контур окна с разными скруглениями верха и низа: верх всегда со скруглением rt,
- * низ уходит в 0 при докинге к краям — дальше окно обрезает сам экран.
- */
-private fun windowPath(l: Float, t: Float, r: Float, b: Float, rt: Float, rb: Float, k: Float): Path {
-    val e = 2f / 2f.pow(k)
-    val steps = 28
-    val path = Path()
-    path.moveTo(l + rt, t)
-    path.lineTo(r - rt, t)
-    for (i in 1..steps) {
-        val a = i / steps.toFloat() * (PI / 2).toFloat()
-        path.lineTo(r - rt + rt * sn(a, e), t + rt - rt * cs(a, e))
-    }
-    path.lineTo(r, b - rb)
-    for (i in 1..steps) {
-        val a = i / steps.toFloat() * (PI / 2).toFloat()
-        path.lineTo(r - rb + rb * cs(a, e), b - rb + rb * sn(a, e))
-    }
-    path.lineTo(l + rb, b)
-    for (i in 1..steps) {
-        val a = i / steps.toFloat() * (PI / 2).toFloat()
-        path.lineTo(l + rb - rb * sn(a, e), b - rb + rb * cs(a, e))
-    }
-    path.lineTo(l, t + rt)
-    for (i in 1..steps) {
-        val a = i / steps.toFloat() * (PI / 2).toFloat()
-        path.lineTo(l + rt - rt * cs(a, e), t + rt - rt * sn(a, e))
-    }
-    path.close()
-    return path
-}
-
-private class WindowShape(private val rect: Rect, private val rTop: Float, private val rBot: Float, private val k: Float) : Shape {
-    override fun createOutline(size: Size, layoutDirection: LayoutDirection, density: Density): Outline =
-        Outline.Generic(windowPath(rect.left, rect.top, rect.right, rect.bottom, rTop, rBot, k))
+        Outline.Generic(squirclePath(rect.left, rect.top, rect.right, rect.bottom, radius, k, bottomRadius))
 }
 
 private val MenuW = 236.dp
 private val MenuH = 120.dp // 8 + два пункта по 52 + 8
 
 /** Где стоят кнопка, меню и окно (в пикселях экрана) и как между ними переходит поверхность. */
-private class MenuGeo(val button: Rect, val menu: Rect, val win: Rect) {
-    fun rect(t: Float): Rect = if (t <= 1f) lerp(button, menu, t) else lerp(menu, win, t - 1f)
+private class MenuGeo(val button: Rect, val menu: Rect, val win: Rect, val screen: Size) {
+    /** Окно, раскрытое на долю s (0..1): по бокам и снизу отступы уходят, верхний край остаётся на месте. */
+    fun winAt(s: Float): Rect = Rect(
+        left = win.left * (1f - s),
+        top = win.top,
+        right = win.right + (screen.width - win.right) * s,
+        bottom = win.bottom + (screen.height - win.bottom) * s,
+    )
+
+    fun rect(t: Float, s: Float = 0f): Rect = if (t <= 1f) lerp(button, menu, t) else lerp(menu, winAt(s), t - 1f)
 }
 
 private fun menuGeo(d: Density, w: Dp, h: Dp, top: Dp, nav: Dp): MenuGeo = with(d) {
@@ -222,6 +202,7 @@ private fun menuGeo(d: Density, w: Dp, h: Dp, top: Dp, nav: Dp): MenuGeo = with(
         button = Rect(Offset((w - 4.dp - 48.dp).toPx(), (top + 4.dp).toPx()), Size(48.dp.toPx(), 48.dp.toPx())),
         menu = Rect(Offset((w - 10.dp - MenuW).toPx(), (top + 8.dp).toPx()), Size(MenuW.toPx(), MenuH.toPx())),
         win = Rect(Offset(6.dp.toPx(), (h - nav - 8.dp - winH).toPx()), Size((w - 12.dp).toPx(), winH.toPx())),
+        screen = Size(w.toPx(), h.toPx()),
     )
 }
 
@@ -240,15 +221,13 @@ fun BoxScopeHeaderMenu(mode: Int, onMode: (Int) -> Unit, onAdd: () -> Unit) {
     val d = LocalDensity.current
 
     val t = remember { Animatable(0f) }
-    // докинг окна к краям: 0 — с отступами, 1 — прижато к краям экрана при прокрутке списка
-    val dock = remember { Animatable(0f) }
-    LaunchedEffect(mode) {
-        if (mode != 2) dock.animateTo(0f, tween(300, easing = FastOutSlowInEasing))
-    }
     val shown by remember { derivedStateOf { t.value > 0.001f } }
     val winVisible by remember { derivedStateOf { t.value > 1.02f } }
     // затемнение живёт своей, более длинной и мягкой анимацией — иначе оно «выстреливает» вместе с быстрым началом перелёта окна
     val dim = remember { Animatable(0f) }
+    // насколько окно раскрыто под экран (0 — с отступами, 1 — вровень с краями); ведёт его прокрутка списка
+    val expand = remember { Animatable(0f) }
+    LaunchedEffect(mode == 2) { if (mode != 2) expand.animateTo(0f, tween(300, easing = FastOutSlowInEasing)) }
     LaunchedEffect(mode == 2) {
         dim.animateTo(if (mode == 2) 1f else 0f, tween(if (mode == 2) 700 else 350, easing = FastOutSlowInEasing))
     }
@@ -294,22 +273,17 @@ fun BoxScopeHeaderMenu(mode: Int, onMode: (Int) -> Unit, onAdd: () -> Unit) {
                     .fillMaxSize()
                     .graphicsLayer {
                         val tt = t.value
-                        if (tt <= 1f) {
-                            // кнопка -> меню: обычное скругление
-                            shape = MorphShape(g.rect(tt), 24f.dp.toPx(), 1f)
-                        } else {
-                            // меню -> окно: как раньше, плавный перелёт (lerp), но финальный прямоугольник
-                            // «докуется» к краям при прокрутке списка
-                            val w = (tt - 1f).coerceIn(0f, 1f)
-                            val dk = dock.value
-                            val side0 = 6f.dp.toPx()
-                            val target = Rect(
-                                Offset(side0 * (1f - dk), g.win.top),
-                                Size(g.win.width + 2f * side0 * dk, g.win.height + 8f.dp.toPx() * dk)
-                            )
-                            val r = (24f + (46f - 24f) * w).dp.toPx()
-                            shape = WindowShape(lerp(g.menu, target, w), r, r * (1f - dk), 1f + 0.7f * w)
-                        }
+                        val w = (tt - 1f).coerceIn(0f, 1f)
+                        val e = expand.value.coerceIn(0f, 1f)
+                        val s = e * e * (3f - 2f * e)
+                        val rad = (24f + (46f - 24f) * w).dp.toPx()
+                        // нижние углы уходят в ноль: дальше их обрезает сам экран
+                        shape = MorphShape(
+                            g.rect(tt, s),
+                            rad,
+                            1f + 0.7f * w,
+                            rad * (1f - s)
+                        )
                         clip = true
                         alpha = (tt / 0.15f).coerceIn(0f, 1f)
                     }
@@ -344,15 +318,16 @@ fun BoxScopeHeaderMenu(mode: Int, onMode: (Int) -> Unit, onAdd: () -> Unit) {
 
                 // окно приложений
                 if (winVisible || mode == 2) {
+                    // содержимое сразу размером с раскрытое окно: при раскрытии растут только края, строки не двигаются
+                    val winTopDp = with(d) { g.win.top.toDp() }
                     SheetContent(
                         Modifier
-                            .fillMaxSize()
-                            .graphicsLayer {
-                                translationX = 6f.dp.toPx() * (1f - dock.value)
-                                translationY = g.win.top
-                                alpha = ((t.value - 1.45f) / 0.5f).coerceIn(0f, 1f)
-                            },
-                        dock
+                            .offset { IntOffset(0, g.win.top.roundToInt()) }
+                            .requiredSize(maxWidth, maxHeight - winTopDp)
+                            .graphicsLayer { alpha = ((t.value - 1.45f) / 0.5f).coerceIn(0f, 1f) },
+                        expand = expand,
+                        active = mode == 2,
+                        bottomPad = nav + 8.dp + 24.dp,
                     )
                 }
             }
@@ -384,9 +359,8 @@ private fun MenuItem(title: String, enabled: Boolean, icon: @Composable () -> Un
 }
 
 @Composable
-private fun SheetContent(modifier: Modifier, dock: Animatable<Float, AnimationVector1D>) {
+private fun SheetContent(modifier: Modifier, expand: Animatable<Float, AnimationVector1D>, active: Boolean, bottomPad: Dp) {
     val p = LocalPalette.current
-    val d = LocalDensity.current
     val excluded by Repo.excluded.collectAsState()
     // порядок фиксируем при открытии: выбранные сверху, дальше по алфавиту — строки не прыгают при нажатии
     val startExcluded = remember { Repo.excluded.value }
@@ -400,17 +374,17 @@ private fun SheetContent(modifier: Modifier, dock: Animatable<Float, AnimationVe
     val listAlpha by animateFloatAsState(if (apps != null) 1f else 0f, tween(260), label = "list")
 
     val listState = rememberLazyListState()
-    // прокрутка списка на 40 px раскрывает окно: отступы по бокам и снизу и нижние углы уходят,
-    // верх остаётся на месте; вернулись наверх — окно снова «отрывается» от краёв
-    LaunchedEffect(listState) {
-        val dist = with(d) { 40.dp.toPx() }
-        val itemH = with(d) { 56.dp.toPx() }
-        snapshotFlow { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset }
-            .collect { (i, o) ->
-                val raw = ((i * itemH + o) / dist).coerceIn(0f, 1f)
-                val s = raw * raw * (3f - 2f * raw) // smootherstep, как в макете
-                if (dock.targetValue != s) dock.animateTo(s, tween(140, easing = LinearEasing))
-            }
+    // прокрутка списка раскрывает окно: за 40 dp отступы по бокам и снизу плавно уходят, назад — возвращаются
+    val reachPx = with(LocalDensity.current) { 40.dp.toPx() }
+    LaunchedEffect(listState, active) {
+        if (!active) return@LaunchedEffect
+        snapshotFlow {
+            if (listState.firstVisibleItemIndex > 0) 1f
+            else (listState.firstVisibleItemScrollOffset / reachPx).coerceIn(0f, 1f)
+        }.collectLatest { target ->
+            // небольшое сглаживание, чтобы окно не дёргалось вслед за пальцем
+            expand.animateTo(target, spring(dampingRatio = 1f, stiffness = Spring.StiffnessMedium))
+        }
     }
     val fade by remember {
         derivedStateOf {
@@ -424,7 +398,7 @@ private fun SheetContent(modifier: Modifier, dock: Animatable<Float, AnimationVe
             LazyColumn(
                 Modifier.fillMaxSize().graphicsLayer { alpha = listAlpha }.topFade(96.dp) { fade },
                 state = listState,
-                contentPadding = PaddingValues(top = 68.dp, bottom = 24.dp)
+                contentPadding = PaddingValues(top = 68.dp, bottom = bottomPad)
             ) {
                 items(list, key = { it.pkg }) { app ->
                     val on = app.pkg in excluded
@@ -435,7 +409,7 @@ private fun SheetContent(modifier: Modifier, dock: Animatable<Float, AnimationVe
                                 interactionSource = remember { MutableInteractionSource() },
                                 indication = null
                             ) { Repo.toggleExcluded(app.pkg) }
-                            .padding(horizontal = 24.dp, vertical = 8.dp),
+                            .padding(horizontal = 30.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         AppIcon(app.pkg)
