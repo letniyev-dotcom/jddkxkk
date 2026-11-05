@@ -195,6 +195,10 @@ object Repo {
     @Volatile
     var holdScroll = false
 
+    /** true, пока идёт анимация смены темы. */
+    @Volatile
+    var holdTheme = false
+
     private fun publishPing(id: String, value: Int) {
         synchronized(pingLock) {
             pendingPings[id] = value
@@ -209,7 +213,7 @@ object Repo {
 
     /** Выдаёт накопленные замеры в pings одним обновлением. Во время перетаскивания ничего не делает. */
     fun flushPings() {
-        if (holdPings || holdScroll) {
+        if (holdPings || holdScroll || holdTheme) {
             // повторим позже, когда отпустят
             synchronized(pingLock) {
                 if (pendingPings.isNotEmpty() && flushJob?.isActive != true) {

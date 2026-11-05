@@ -32,6 +32,13 @@ import androidx.compose.ui.graphics.TransformOrigin
 import kotlin.math.abs
 import android.content.Context
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.EnterExitState
+import androidx.compose.animation.togetherWith
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
@@ -266,7 +273,7 @@ private fun Content(
                 onReconnect()
             }
             Spacer(Modifier.height(10.dp))
-            SubsCard(subs, bestId, shownState, pingsState, keepId, scroll, top, bottom, onPickAvatar) { id ->
+            SubsCard(subs, shownState, pingsState, keepId, scroll, top, bottom, onPickAvatar) { id ->
                 Repo.select(id)
                 onReconnect()
             }
@@ -312,12 +319,23 @@ private fun Content(
                                 if (bmp == null) {
                                     Repo.setThemeDark(toDark)
                                 } else {
-                                    reveal = Reveal(bmp.asImageBitmap(), from, toDark)
-                                    Repo.setThemeDark(toDark)
                                     scope.launch {
-                                        revealT.snapTo(0f)
-                                        revealT.animateTo(1f, tween(950, easing = REVEAL_EASING))
-                                        reveal = null
+                                        // пока идёт смена, свежие пинги на экран не выдаём
+                                        Repo.holdTheme = true
+                                        try {
+                                            revealT.snapTo(0f)
+                                            reveal = Reveal(bmp.asImageBitmap(), from, toDark)
+                                            Repo.setThemeDark(toDark)
+                                            // тяжёлая перекомпоновка в новой теме проходит под полностью непрозрачным
+                                            // снимком, поэтому анимацию запускаем только через пару кадров — без подлагивания
+                                            withFrameNanos { }
+                                            withFrameNanos { }
+                                            revealT.animateTo(1f, tween(950, easing = REVEAL_EASING))
+                                        } finally {
+                                            reveal = null
+                                            Repo.holdTheme = false
+                                            Repo.flushPings()
+                                        }
                                     }
                                 }
                             }
@@ -326,7 +344,28 @@ private fun Content(
                 contentAlignment = Alignment.Center
             ) {
                 // в тёмной теме показываем солнце (переключить на светлую), в светлой — луну
-                ThemeIcon(p.dark, p.primary, 24.dp)
+                AnimatedContent(
+                    targetState = p.dark,
+                    transitionSpec = {
+                        (fadeIn(tween(380, delayMillis = 90)) +
+                            scaleIn(tween(380, delayMillis = 90, easing = FastOutSlowInEasing), initialScale = 0.4f))
+                            .togetherWith(fadeOut(tween(220)) + scaleOut(tween(300), targetScale = 0.4f))
+                    },
+                    label = "themeIcon"
+                ) { dark ->
+                    // новая иконка выезжает с поворотом, старая уезжает в другую сторону
+                    val rot by transition.animateFloat(
+                        transitionSpec = { tween(480, easing = FastOutSlowInEasing) },
+                        label = "themeIconRot"
+                    ) { st ->
+                        when (st) {
+                            EnterExitState.PreEnter -> -100f
+                            EnterExitState.Visible -> 0f
+                            EnterExitState.PostExit -> 100f
+                        }
+                    }
+                    Box(Modifier.graphicsLayer { rotationZ = rot }) { ThemeIcon(dark, p.primary, 24.dp) }
+                }
             }
             val dotsAlpha by animateFloatAsState(
                 if (menuMode == 0) 1f else 0f,
@@ -647,7 +686,6 @@ private fun Switch(on: Boolean, onToggle: () -> Unit) {
 @Composable
 private fun SubsCard(
     subs: List<Sub>,
-    bestId: State<String?>,
     shownId: State<Server?>,
     pings: State<Map<String, Int>>,
     /** Сервер, к которому сейчас подключены: остаётся в списке, даже если пинг не прошёл. */
@@ -900,7 +938,7 @@ private fun SubsCard(
                             // серверы без ответа уходят и возвращаются плавно, а не рывком
                             sub.servers.forEach { s ->
                                 key(s.id) {
-                                    ServerSlot(s, shownId, bestId, pings, keepId) { onPick(s.id) }
+                                    ServerSlot(s, shownId, pings, keepId) { onPick(s.id) }
                                 }
                             }
                             Spacer(Modifier.height(4.dp))
@@ -998,32 +1036,27 @@ private fun SubInfoLine(sub: Sub, pings: State<Map<String, Int>>, keepId: State<
 
 /**
  * Строка сервера, которая плавно сворачивается, когда сервер не отвечает, и так же плавно возвращается.
- * Каждая строка читает только свой пинг: при новой пачке замеров перерисовываются лишь те строки,
- * у которых число действительно изменилось.
+ * Пинг в списке не показывается, но по нему по-прежнему решается, показывать ли строку.
  */
 @Composable
 private fun ServerSlot(
     s: Server,
     shownId: State<Server?>,
-    bestId: State<String?>,
     pings: State<Map<String, Int>>,
     keepId: State<String?>,
     onClick: () -> Unit,
 ) {
-    val ping by remember(s.id) { derivedStateOf { pings.value[s.id] } }
+    // пинг в списке не показываем; он нужен только чтобы свернуть недоступный сервер,
+    // поэтому строка перерисовывается лишь когда меняется её видимость или выбор
+    val visible by remember(s.id) { derivedStateOf { pings.value[s.id] != -1 || s.id == keepId.value } }
     val selected by remember(s.id) { derivedStateOf { shownId.value?.id == s.id } }
-    val best by remember(s.id) { derivedStateOf { bestId.value == s.id } }
-    val visible = ping != -1 || s.id == keepId.value
-    // пока строка уходит, оставляем последний рабочий пинг, а не «—»
-    val last = remember { arrayOf(ping) }
-    if (ping != -1) last[0] = ping
     Collapsible(expanded = visible) {
-        ServerRow(s, selected, best, if (ping == -1) last[0] else ping, onClick)
+        ServerRow(s, selected, onClick)
     }
 }
 
 @Composable
-private fun ServerRow(s: Server, selected: Boolean, best: Boolean, ping: Int?, onClick: () -> Unit) {
+private fun ServerRow(s: Server, selected: Boolean, onClick: () -> Unit) {
     val p = LocalPalette.current
     val nameColor = if (selected) p.primary else p.text
     Row(
@@ -1050,20 +1083,6 @@ private fun ServerRow(s: Server, selected: Boolean, best: Boolean, ping: Int?, o
             maxLines = 1, overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f)
         )
-        val pingColor = if (best && (ping ?: -1) > 0) p.primary else p.text2
-        if (ping != null && ping > 0) {
-            Row(Modifier.padding(start = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                RollingNumber(ping, pingColor, 12.sp, FontWeight.Medium)
-                Text(" мс", color = pingColor, fontSize = 12.sp, fontWeight = FontWeight.Medium, maxLines = 1)
-            }
-        } else {
-            Text(
-                if (ping == null) "…" else "—",
-                color = pingColor,
-                fontSize = 12.sp, fontWeight = FontWeight.Medium,
-                modifier = Modifier.padding(start = 8.dp)
-            )
-        }
         Box(Modifier.size(22.dp), contentAlignment = Alignment.Center) {
             if (selected) PolyIcon(CHECK, p.primary, 20.dp)
         }
