@@ -250,8 +250,8 @@ fun BoxScopeHeaderMenu(mode: Int, onMode: (Int) -> Unit, onAdd: () -> Unit) {
         val nav = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
         BoxWithConstraints(Modifier.fillMaxSize()) {
             val g = remember(maxWidth, maxHeight, top, nav, d) { menuGeo(d, maxWidth, maxHeight, top, nav) }
-            val winW = maxWidth - 12.dp
-            val winH = maxHeight * 0.78f
+            val screenW = maxWidth
+            val screenH = maxHeight
 
             // лёгкое затемнение фона, тап мимо закрывает
             Box(
@@ -323,7 +323,7 @@ fun BoxScopeHeaderMenu(mode: Int, onMode: (Int) -> Unit, onAdd: () -> Unit) {
                     SheetContent(
                         Modifier
                             .offset { IntOffset(0, g.win.top.roundToInt()) }
-                            .requiredSize(maxWidth, maxHeight - winTopDp)
+                            .requiredSize(screenW, screenH - winTopDp)
                             .graphicsLayer { alpha = ((t.value - 1.45f) / 0.5f).coerceIn(0f, 1f) },
                         expand = expand,
                         active = mode == 2,
